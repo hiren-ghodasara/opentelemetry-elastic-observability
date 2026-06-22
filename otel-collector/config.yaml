@@ -1,0 +1,167 @@
+# ============================================================
+# OpenTelemetry Collector Configuration
+#
+# Pipeline:
+#   App → [OTLP gRPC/HTTP] → Collector → Elastic APM Server
+#
+# Receivers: accept telemetry from the application
+# Processors: transform, batch, limit memory
+# Exporters: send to Elastic stack
+# ============================================================
+
+receivers:
+  # OTLP gRPC receiver — primary protocol for SDK export
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://*"
+            - "https://*"
+
+  # Collector self-metrics — useful for understanding collector health
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "otel-collector"
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["localhost:8888"]
+
+processors:
+  # ── Memory Limiter ────────────────────────────────────────
+  # Prevents OOM by refusing new data when near limit.
+  # Must be FIRST in every pipeline.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # ── Batch Processor ──────────────────────────────────────
+  # Groups spans/metrics/logs into batches before export.
+  # Reduces network overhead and improves throughput.
+  batch:
+    send_batch_size: 1024
+    timeout: 5s
+    send_batch_max_size: 2048
+
+  # ── Resource Processor ───────────────────────────────────
+  # Adds or overrides resource attributes on all telemetry.
+  # Useful for enriching data with environment-level metadata.
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: "demo"
+        action: upsert
+      - key: collector.version
+        value: "0.99.0"
+        action: insert
+
+  # ── Attributes Processor (traces) ────────────────────────
+  # Modifies span attributes — can redact PII, add defaults.
+  attributes:
+    actions:
+      - key: http.user_agent
+        action: hash  # Hash user agents to protect privacy
+      - key: demo.collector_processed
+        value: "true"
+        action: insert
+
+  # ── Filter Processor ─────────────────────────────────────
+  # Drop health-check spans to reduce noise.
+  filter/drop_health_checks:
+    spans:
+      exclude:
+        match_type: regexp
+        attributes:
+          - key: http.target
+            value: "^/health.*"
+
+exporters:
+  # ── Elastic APM Server ───────────────────────────────────
+  # Sends traces as Elastic APM events.
+  otlp/elastic:
+    endpoint: "http://apm-server:8200"
+    tls:
+      insecure: true
+    headers:
+      Authorization: "Bearer supersecrettoken"
+
+  # ── Elasticsearch Logs Exporter ──────────────────────────
+  # Sends logs directly to Elasticsearch data stream.
+  elasticsearch:
+    endpoints: ["http://elasticsearch:9200"]
+    user: elastic
+    password: changeme
+    logs_index: logs-coffeebrew-demo
+
+  # ── Debug Exporter ───────────────────────────────────────
+  # Logs telemetry to collector stdout — helpful for debugging.
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 100
+
+  # ── Prometheus Exporter ──────────────────────────────────
+  # Exposes metrics on /metrics endpoint for scraping.
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: coffeebrew
+
+extensions:
+  # Health check endpoint — used by Docker healthcheck
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # zPages — in-process debugging UI at :55679/debug/tracez
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+  # pprof — Go profiling endpoint (collector internals)
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+service:
+  extensions: [health_check, zpages, pprof]
+
+  pipelines:
+    # ── Traces Pipeline ──────────────────────────────────────
+    # Receives spans → filters health checks → batches → sends to Elastic APM
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - filter/drop_health_checks
+        - resource
+        - attributes
+        - batch
+      exporters: [otlp/elastic, debug]
+
+    # ── Metrics Pipeline ─────────────────────────────────────
+    # Receives metrics → batches → sends to Elastic + Prometheus
+    metrics:
+      receivers: [otlp, prometheus]
+      processors:
+        - memory_limiter
+        - resource
+        - batch
+      exporters: [otlp/elastic, prometheus, debug]
+
+    # ── Logs Pipeline ────────────────────────────────────────
+    # Receives logs → enriches → batches → sends to Elasticsearch
+    logs:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - resource
+        - batch
+      exporters: [otlp/elastic, elasticsearch, debug]
+
+  telemetry:
+    logs:
+      level: "warn"
+    metrics:
+      address: 0.0.0.0:8888

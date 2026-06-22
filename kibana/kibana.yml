@@ -1,0 +1,15 @@
+server.host: "0.0.0.0"
+server.shutdownTimeout: "5s"
+
+monitoring.ui.container.elasticsearch.enabled: true
+monitoring.ui.container.logstash.enabled: true
+
+# Encryption keys — must be ≥32 chars, same value across restarts
+xpack.security.encryptionKey: "abc123abc123abc123abc123abc123ab"
+xpack.encryptedSavedObjects.encryptionKey: "abc123abc123abc123abc123abc123ab"
+xpack.reporting.encryptionKey: "abc123abc123abc123abc123abc123ab"
+
+xpack.fleet.enabled: true
+xpack.apm.serviceMapEnabled: true
+
+logging.root.level: warn

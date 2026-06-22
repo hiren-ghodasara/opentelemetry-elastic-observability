@@ -1,0 +1,294 @@
+x-elastic-common: &elastic-common
+  environment:
+    - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+services:
+  # ─────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ─────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    <<: *elastic-common
+    container_name: elasticsearch
+    environment:
+      - node.name=elasticsearch
+      - cluster.name=otel-demo-cluster
+      - discovery.type=single-node
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - otel-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD:-changeme} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.13.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD:-changeme}
+    volumes:
+      - kibanadata:/usr/share/kibana/data
+      - ./kibana/kibana.yml:/usr/share/kibana/config/kibana.yml:ro
+    ports:
+      - "5601:5601"
+    networks:
+      - otel-net
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      setup-es:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q '\"overall\":{\"level\":\"available\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+
+  apm-server:
+    image: docker.elastic.co/apm/apm-server:8.13.0
+    container_name: apm-server
+    command: >
+      apm-server -e
+        -E apm-server.rum.enabled=true
+        -E setup.kibana.host=kibana:5601
+        -E setup.template.settings.index.number_of_replicas=0
+        -E apm-server.kibana.enabled=true
+        -E apm-server.kibana.host=kibana:5601
+        -E apm-server.kibana.username=elastic
+        -E apm-server.kibana.password=${ELASTIC_PASSWORD:-changeme}
+        -E output.elasticsearch.hosts=["elasticsearch:9200"]
+        -E output.elasticsearch.username=elastic
+        -E output.elasticsearch.password=${ELASTIC_PASSWORD:-changeme}
+        -E apm-server.secret_token=${APM_SECRET_TOKEN:-supersecrettoken}
+    ports:
+      - "8200:8200"
+    networks:
+      - otel-net
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kibana:
+        condition: service_healthy
+      setup-kibana:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8200' 2>/dev/null && echo ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      - POSTGRES_DB=coffeebrew
+      - POSTGRES_USER=coffeebrew
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-coffeebrew123}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - otel-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coffeebrew -d coffeebrew"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - otel-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─────────────────────────────────────────────
+  # OPENTELEMETRY COLLECTOR
+  # ─────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.99.0
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics (collector self-metrics)
+      - "8889:8889"   # Prometheus exporter metrics
+      - "13133:13133" # Health check
+      - "55679:55679" # zpages
+    networks:
+      - otel-net
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      apm-server:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────
+  # SETUP STEP 1: set kibana_system password
+  # Runs before Kibana starts so Kibana can auth.
+  # ─────────────────────────────────────────────
+  setup-es:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: setup-es
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "==> [1/2] Waiting for Elasticsearch..."
+        until curl -s -u elastic:${ELASTIC_PASSWORD:-changeme} http://elasticsearch:9200/_cluster/health | grep -q '"status"'; do
+          sleep 5
+        done
+        echo "==> [2/2] Setting kibana_system password..."
+        curl -s -X POST -u elastic:${ELASTIC_PASSWORD:-changeme} \
+          http://elasticsearch:9200/_security/user/kibana_system/_password \
+          -H "Content-Type: application/json" \
+          -d "{\"password\":\"${KIBANA_SYSTEM_PASSWORD:-changeme}\"}"
+        echo ""
+        echo "==> ES setup complete."
+    networks:
+      - otel-net
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────
+  # SETUP STEP 2: install APM Fleet integration
+  # Runs after Kibana is healthy.
+  # ─────────────────────────────────────────────
+  setup-kibana:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: setup-kibana
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "==> [1/2] Waiting for Kibana to be available..."
+        until curl -s -u elastic:${ELASTIC_PASSWORD:-changeme} \
+          http://kibana:5601/api/status 2>/dev/null | grep -q '"level":"available"'; do
+          echo "   Kibana not ready yet, retrying in 10s..."
+          sleep 10
+        done
+        echo "==> [2/2] Installing APM Fleet integration package..."
+        curl -s -X POST -u elastic:${ELASTIC_PASSWORD:-changeme} \
+          http://kibana:5601/api/fleet/setup \
+          -H "kbn-xsrf: true" -H "Content-Type: application/json"
+        echo ""
+        curl -s -X POST -u elastic:${ELASTIC_PASSWORD:-changeme} \
+          "http://kibana:5601/api/fleet/epm/packages/apm" \
+          -H "kbn-xsrf: true" -H "Content-Type: application/json" \
+          -d '{"force":true}'
+        echo ""
+        echo "==> Kibana setup complete."
+    networks:
+      - otel-net
+    depends_on:
+      kibana:
+        condition: service_healthy
+
+  # ─────────────────────────────────────────────
+  # APPLICATION
+  # ─────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: coffeebrew-backend
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - DATABASE_URL=postgresql://coffeebrew:${POSTGRES_PASSWORD:-coffeebrew123}@postgres:5432/coffeebrew
+      - REDIS_URL=redis://redis:6379
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+      - OTEL_SERVICE_NAME=coffeebrew-backend
+      - OTEL_SERVICE_VERSION=1.0.0
+      - OTEL_RESOURCE_ATTRIBUTES=deployment.environment=demo,service.namespace=coffeebrew
+      - APM_SECRET_TOKEN=${APM_SECRET_TOKEN:-supersecrettoken}
+      - LOG_LEVEL=debug
+      - EXTERNAL_API_URL=http://mock-external-api:3002
+    ports:
+      - "3001:3001"
+    networks:
+      - otel-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  mock-external-api:
+    build:
+      context: ./mock-external-api
+      dockerfile: Dockerfile
+    container_name: mock-external-api
+    environment:
+      - PORT=3002
+    ports:
+      - "3002:3002"
+    networks:
+      - otel-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - REACT_APP_API_URL=http://localhost:3001
+    container_name: coffeebrew-frontend
+    ports:
+      - "3000:80"
+    networks:
+      - otel-net
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  esdata:
+    driver: local
+  kibanadata:
+    driver: local
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+
+networks:
+  otel-net:
+    driver: bridge
